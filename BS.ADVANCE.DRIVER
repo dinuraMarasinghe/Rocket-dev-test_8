@@ -1,0 +1,1530 @@
+       PROGRAM BS.ADVANCE.DRIVER
+       PROGRAM.NAME = "BS.ADVANCE.DRIVER"
+*********************************************************************
+* Description
+* -----------------------------
+* Driver program for the cash advance setup amend maintenance routines
+* allowing entry/enquiry/statements/receipt print
+*
+*********************************************************************
+*
+* Author       : Trevor Van Kleef
+* Date Written : 21st August 1995
+*
+* Job #   Date    Who  Comments
+* ===== ======== ===== ========
+* 10325 01/11/00 marka  Preserve lock of BS-CASH-ADVANCE when updating in
+*                       the UPDATE.HEADER routine (printing a statement
+*                       released the header.
+* 11273 04/10/02 jwool  Network ticket printing
+* 11692 04/12/03 rachp  Credit Card refunds
+* 11490 16/04/04 ashbr  Seagull screen ID
+* 11781r6 20/10/04 andrm INCA change to cater for special clearance cheques
+* 12366r4 14/07/05 MMIMM To standardise Seagull Id's
+* 12818   23/10/06 mherr  Add Bank Transfer as payment type
+* 13818r8 04/06/09 rcott Add warning message to 'Stop Receipt' process
+* 13889r6 01/07/09 delse Add CLOSE option
+* 14979r02 16/08/12 DHEND Verifone IP card reader integration
+* 14979r02 03/09/12 praja Bug Fix
+* 15301r40 05/02/16 vagre Display warning if no PED attached
+*                  /wephi
+* 15547r50 08/11/17 brrob PRB0006041 - Change Password input to up to
+*                         24 characters on POS
+* 15633r24 07/08/20 cmaud Get to work from OFF-B
+* 15706r27 18/10/22 keson Update CASH file with Payment Set Id for Oracle traceability
+* 15737r07 21/09/23 dhend Changes for paypage
+* 15759r01 20/03/24 emsha ITF-2249 Increase CASH Dim Array (Recompile only)
+* 15764r55 18/12/24 kerav PRB0008418 - Invalid cash advance details are being written
+*********************************************************************
+
+       INCLUDE DG-INCLUDES TCSTANDARD
+
+***********
+* EQUATES *
+***********
+
+       EQU TRUE TO 1
+       EQU FALSE TO 0
+       EQU NULL TO ""
+       EQU DIM TO TCDIM
+       EQU RESET TO NORMAL
+
+************
+* INCLUDES *
+************
+
+       INCLUDE INCLUDES EQU.TERMWORK
+       INCLUDE INCLUDES EQU.BRN.DETAIL.DIM
+       INCLUDE INCLUDES EQU.BS.CASH.ADVANCE.DIM
+       INCLUDE INCLUDES EQU.BS.CASH.ADVANCE.AUDIT.DIM
+       INCLUDE INCLUDES EQU.BS.CASH.ADVANCE.TRANSACTION.DIM
+       INCLUDE INCLUDES EQU.CASH.DIM
+       INCLUDE INCLUDES EQU.CASH.XREF.DIM
+       INCLUDE INCLUDES EQU.BS.TCC.TO.ADVANCE.XREF.DIM
+       INCLUDE INCLUDES MN.TERMWORK.COMMON
+       INCLUDE INCLUDES EQU.CHQ.PAYMENT.DIM
+
+**************
+* FILE OPENS *
+**************
+
+       ACCOUNT.NAME = OCONV(@WHO,'MCU')
+       ERR = ''
+
+       INCLUDE INCLUDES OPEN.FILE.TERMWORK
+       INCLUDE INCLUDES OPEN.FILE.SY.PARAMS
+
+       INCLUDE INCLUDES COMMON.SCREEN
+       INCLUDE INCLUDES BUILD.TOP.RIGHT
+
+       MATREAD TERMWORK.REC FROM TERMWORK.FV,PORT ELSE
+          FATAL.ERROR.MSG = "CANNOT READ ":PORT:" FROM TERMWORK FILE"
+          GOSUB FATAL.ERROR
+       END
+
+       READ SY.MACHINE.REC FROM SY.PARAMS.FV,"SY.MACHINE" ELSE
+          SY.MACHINE.REC = ""
+       END
+       THIS.MACHINE = SY.MACHINE.REC<3>
+
+       INCLUDE INCLUDES OPEN.FILE.STOCK.PARAMS
+       INCLUDE INCLUDES OPEN.FILE.SCREENS
+       INCLUDE INCLUDES OPEN.FILE.BRN.DETAIL
+       INCLUDE INCLUDES OPEN.FILE.VOC
+
+       IF THIS.MACHINE # "OFF-B" THEN
+          INCLUDE INCLUDES OPEN.FILE.BS.CASH.ADVANCE
+          INCLUDE INCLUDES OPEN.FILE.BS.CASH.ADVANCE.TRANSACTION
+          INCLUDE INCLUDES OPEN.FILE.CASH
+          INCLUDE INCLUDES OPEN.FILE.CASH.XREF
+          INCLUDE INCLUDES OPEN.FILE.BS.CASH.ADVANCE.AUDIT
+          INCLUDE INCLUDES OPEN.FILE.BS.TCC.TO.ADVANCE.XREF
+          INCLUDE INCLUDES OPEN.FILE.CHQ.PAYMENT
+       END ELSE
+          GOSUB OPEN.REMOTE.FILES
+       END
+
+       INCLUDE INCLUDES CARD.COMMON
+       INCLUDE INCLUDES OPEN.FILE.USER.DEFS
+
+       IF ERR NE '' THEN
+          FATAL.ERROR.MSG = "CANNOT OPEN FILES ":ERR
+          GOSUB FATAL.ERROR
+       END
+
+       GOSUB MAIN.PROG
+
+************
+* PROG.END *
+************
+
+       STOP
+
+**************************************************************************
+**********
+MAIN.PROG:
+**********
+
+       CRT CURSOR.OFF:
+
+       GOSUB INITIALISATION
+
+       GOSUB READ.AND.DISPLAY.SCREEN
+
+       GOSUB ADVANCE.HEADER
+
+       IF NOT(GET.OUT) THEN
+
+          SEL.POS = 1                     ; * Default option
+          GOSUB SET.UP.SELECTION.LINE
+
+          IF ADVANCE.NO = "*" THEN
+
+             ADVANCE.TYPE = "1"
+             GOSUB GET.PAYMENT
+             HEADER.TYPE = "D"
+             GOSUB ADVANCE.HEADER.DISP
+
+          END
+
+          IF NOT(GET.OUT) THEN
+
+             GOSUB DISPLAY.TRANSACTIONS
+
+             GOSUB DO.LINE.SELECTION.AND.ACTION
+
+          END
+       END
+
+       CRT CURSOR.ON:
+
+       RETURN
+
+***************************************************************************
+***************
+INITIALISATION:
+***************
+
+       EXT.TODAY = OCONV(DATE(),'D2/')
+
+       GET.OUT = FALSE
+
+       CSH.CASH.ADVANCE.REFUND = ""
+       ADVANCE.NO = ''
+       NEW.ADVANCE = FALSE
+       AUDIT.HEADER = TRUE
+       SET.ORIG = TRUE
+       MAT CASH.ADVANCE.AUDIT.REC = ''
+       MAT CASH.ADVANCE.REC = ''
+
+       READV CHEQUE.CLR.DAYS FROM STOCK.PARAMS.FV,"CHEQUE.ADVANCE.CLEARANCE.PERIOD",1 ELSE
+          CHEQUE.CLR.DAYS = 7
+          WRITE CHEQUE.CLR.DAYS ON STOCK.PARAMS.FV,"CHEQUE.ADVANCE.CLEARANCE.PERIOD"
+       END
+       CLEAR.BEFORE.DATE = ''
+       CALL NO.OF.WORKING.DAYS(CLEAR.BEFORE.DATE,DATE(),CHEQUE.CLR.DAYS)
+
+       BALANCE.LIST = ''
+       DISP.PAGE = 1
+       HEADER.TYPE = ""
+
+* set error vars
+       ERROR.CODE = 0
+       ERROR.MSG = ''
+
+* read common
+       REM.BRANCH = ""
+       IF THIS.MACHINE # "OFF-B" THEN
+          CALL BS.OE.PRINT.SETUP(ERROR.CODE,ERROR.MSG,REM.BRANCH,'','')
+          IF ERROR.CODE THEN
+             CALL BS.OE.SHOW.ERROR(ERROR.CODE,ERROR.MSG,"BS.OE.PRINT.SETUP")
+          END
+       END
+
+       CLOSE.STAT.SET = ""
+
+       MATREAD BRN.DETAIL.REC FROM BRN.DETAIL.FV,TRM.BRN.CODE'R%4' ELSE
+          FATAL.ERROR.MSG = 'UNABLE TO READ BRANCH RECORD FOR BRANCH ':TRM.BRN.CODE'R%4'
+          GOSUB FATAL.ERROR
+       END
+
+       CALL FINMOD.FUNCTIONALITY("PAYMENT.SET.ID",OUT.DATA,FINMOD.ERRORS)
+
+       FINMOD.ON = OUT.DATA<1,1>
+
+       CALL FEATURE.SWITCH("PAYPAGE.ENABLED", TRM.BRN.CODE,PAYPAGE.IS.ENABLED,"","")
+
+       RETURN
+
+***************************************************************************
+************************
+READ.AND.DISPLAY.SCREEN:
+************************
+
+       SCREEN.NAME = "$":PROGRAM.NAME
+       READ SCREEN.1 FROM SCREENS.FV,SCREEN.NAME ELSE
+          FATAL.ERROR.MSG = "CANNOT READ ":SCREEN.NAME:" FROM SCREENS FILE"
+          GOSUB FATAL.ERROR
+       END
+
+       PART.SCREEN.NAME = "%":PROGRAM.NAME
+       READ SCREEN.1.PARTS FROM SCREENS.FV,PART.SCREEN.NAME ELSE
+          FATAL.ERROR.MSG = "CANNOT READ ":SCREEN.NAME:" FROM SCREENS FILE"
+          GOSUB FATAL.ERROR
+       END
+
+       COMMON.SCREEN.NAME = "#":PROGRAM.NAME
+       READ SCREEN.1.COMMON FROM SCREENS.FV,COMMON.SCREEN.NAME ELSE
+          FATAL.ERROR.MSG = "CANNOT READ ":SCREEN.NAME:" FROM SCREENS FILE"
+          GOSUB FATAL.ERROR
+       END
+       CRT.VAR = CLS:SCREEN.1:@(1,0):EXT.TODAY:TOP.RIGHT ; CRT CRT.VAR
+       SC.CURR = SCREEN.1.COMMON
+
+       RETURN
+
+***************************************************************************
+**********************
+SET.UP.SELECTION.LINE:
+**********************
+
+       SEL.PROMPT = ''
+       CHOICE = ''
+       DELCHAR = '*'
+       SEL.DELIM = "Þ"
+       ACTIVATE = 'Y'                     ; * To turn aroow keys on and off
+       SECONDARY.FORMAT = ''
+
+       IF CA.STATUS # 3 OR CLOSE.STAT.SET THEN
+          SEL.WORDS = "F":VM:"Q"
+          SEL.ABBRV = "F": VM:"Q"
+          SEL.RTNS = "FILE":VM:"QUIT"
+          SEL.HELP = "Leave this screen saving any changes"
+          SEL.HELP<1,2> = "Leave this screen without saving changes"
+       END ELSE
+          SEL.WORDS = "Quit"
+          SEL.ABBRV = "Q"
+          SEL.RTNS = "QUIT"
+          SEL.HELP = "Leave this screen"
+       END
+
+       NO.OF.PAGES = INT(CA.NUMBER.OF.LINES/10) + (MOD(CA.NUMBER.OF.LINES,10) # 0)
+       IF NO.OF.PAGES GT 1 THEN
+          GOSUB DISP.PAGE.COUNT
+          BEGIN CASE
+             CASE DISP.PAGE GT 1 AND DISP.PAGE LT NO.OF.PAGES
+                SEL.WORDS := VM:"N":VM:"preV":VM:"G"
+                SEL.ABBRV := VM:"N":VM:"V":VM:"G"
+                SEL.RTNS := VM:"NEXT":VM:"PREVIOUS":VM:"GOTO"
+                SEL.HELP<1,-1> = "Display next page of summary transactions"
+                SEL.HELP<1,-1> = "Display previous page of summary transactions"
+                SEL.HELP<1,-1> = "Go to a specific page of summary transactions"
+             CASE DISP.PAGE = 1
+                SEL.WORDS := VM:"N":VM:"G"
+                SEL.ABBRV := VM:"N":VM:"G"
+                SEL.RTNS := VM:"NEXT":VM:"GOTO"
+                SEL.HELP<1,-1> = "Display next page of summary transactions"
+                SEL.HELP<1,-1> = "Go to a specific page of summary transactions"
+             CASE DISP.PAGE = NO.OF.PAGES
+                SEL.WORDS := VM:"preV":VM:"G"
+                SEL.ABBRV := VM:"V":VM:"G"
+                SEL.RTNS := VM:"PREVIOUS":VM:"GOTO"
+                SEL.HELP<1,-1> = "Display previous page of summary transactions"
+                SEL.HELP<1,-1> = "Go to a specific page of summary transactions"
+
+          END CASE
+          LOWER.RNG = 1
+          HIGHER.RNG = NO.OF.PAGES
+
+          LOCATE 'GOTO' IN SEL.RTNS<1> SETTING XPOS THEN
+             SEL.PROMPT<1,XPOS> = "Enter page to display : "
+             SEL.PROMPT<2,XPOS> = "R#":LEN(HIGHER.RNG)
+             SEL.PROMPT<3,XPOS> = ""
+             SEL.PROMPT<4,XPOS> = "0N"
+             SEL.PROMPT<5,XPOS> = 0
+             SEL.PROMPT<6,XPOS> = 0
+             SEL.PROMPT<7,XPOS> = "Enter Line Number In The Range ":LOWER.RNG:" To ":HIGHER.RNG
+             SEL.PROMPT<8,XPOS> = LOWER.RNG:"*":HIGHER.RNG
+             SECONDARY.FORMAT<1,XPOS> = ""
+          END
+       END
+
+       IF THIS.MACHINE # "OFF-B" THEN
+          IF CA.STATUS # 3 AND CA.CURRENT.BALANCE = 0 THEN
+             SEL.WORDS := VM:"closE"
+             SEL.ABBRV := VM:"E"
+             SEL.RTNS := VM:"CLOSE"
+             SEL.HELP<1,-1> = "Close Advance"
+             CLOSE.STAT.SET = TRUE
+          END
+
+          IF CA.STATUS # 3 THEN
+             SEL.WORDS := VM:"Hdr":VM:"Pay"
+             SEL.ABBRV := VM:"H":VM:"P"
+             SEL.RTNS := VM:"HEADER":VM:"PAYMENT"
+             SEL.HELP<1,-1> = "Amend the account header details"
+             SEL.HELP<1,-1> = "Enter payment information"
+          END
+
+* Add refund details if value > 0
+
+          IF CA.CURRENT.BALANCE <> 0 THEN
+             SEL.WORDS := VM:"Refund"
+             SEL.ABBRV := VM:"R"
+             SEL.RTNS := VM:"REFUND"
+             SEL.HELP<1,-1> = "Enter refund information"
+          END
+       END
+
+       SEL.WORDS := VM:"Statement":VM:"L"
+       SEL.ABBRV := VM:"S":VM:"L"
+       SEL.RTNS := VM:"STATEMENT":VM:"LINE"
+       SEL.HELP<1,-1> = "Print a customer statement"
+       SEL.HELP<1,-1> = "Display transaction details"
+
+       IF THIS.MACHINE # "OFF-B" THEN
+          IF CA.STATUS # 3 THEN
+             SEL.WORDS := VM:"Clear":VM:"sTop pay"
+             SEL.ABBRV := VM:"C":VM:"T"
+             SEL.RTNS := VM:"CLEAR":VM:"STOP"
+             SEL.HELP<1,-1> = "Clear a pending cheque"
+             SEL.HELP<1,-1> = "Stop a receipt"
+          END
+       END
+
+       LOWER.RNG = 1
+       HIGHER.RNG = CA.NUMBER.OF.LINES+0
+
+       LOCATE 'LINE' IN SEL.RTNS<1> SETTING XPOS THEN
+          SEL.PROMPT<1,XPOS> = "Enter line of payment to display : "
+          SEL.PROMPT<2,XPOS> = "R#":LEN(HIGHER.RNG)
+          SEL.PROMPT<3,XPOS> = ""
+          SEL.PROMPT<4,XPOS> = "0N"
+          SEL.PROMPT<5,XPOS> = 0
+          SEL.PROMPT<6,XPOS> = 0
+          SEL.PROMPT<7,XPOS> = "Enter Line Number In The Range ":LOWER.RNG:" To ":HIGHER.RNG
+          SEL.PROMPT<8,XPOS> = LOWER.RNG:"*":HIGHER.RNG
+          SECONDARY.FORMAT<1,XPOS> = ""
+       END
+
+       LOCATE 'CLEAR' IN SEL.RTNS<1> SETTING XPOS THEN
+          SEL.PROMPT<1,XPOS> = "Enter line of payment to clear : "
+          SEL.PROMPT<2,XPOS> = "R#":LEN(HIGHER.RNG)
+          SEL.PROMPT<3,XPOS> = ""
+          SEL.PROMPT<4,XPOS> = "0N"
+          SEL.PROMPT<5,XPOS> = 0
+          SEL.PROMPT<6,XPOS> = 0
+          SEL.PROMPT<7,XPOS> = "Enter Line Number In The Range ":LOWER.RNG:" To ":HIGHER.RNG
+          SEL.PROMPT<8,XPOS> = LOWER.RNG:"*":HIGHER.RNG
+          SECONDARY.FORMAT<1,XPOS> = ""
+       END
+
+       LOCATE 'STOP' IN SEL.RTNS<1> SETTING XPOS THEN
+          SEL.PROMPT<1,XPOS> = "Enter line of transaction to cancel: "
+          SEL.PROMPT<2,XPOS> = "R#":LEN(HIGHER.RNG)
+          SEL.PROMPT<3,XPOS> = ""
+          SEL.PROMPT<4,XPOS> = "0N"
+          SEL.PROMPT<5,XPOS> = 0
+          SEL.PROMPT<6,XPOS> = 0
+          SEL.PROMPT<7,XPOS> = "Enter Line Number In The Range ":LOWER.RNG:" To ":HIGHER.RNG
+          SEL.PROMPT<8,XPOS> = LOWER.RNG:"*":HIGHER.RNG
+          SECONDARY.FORMAT<1,XPOS> = ""
+       END
+
+       S.SEL.PROMPT = ''
+       S.SEL.POS = 2                      ; * Default option
+       S.SECONDARY.FORMAT = ''
+       S.SEL.WORDS = "Finish"
+       S.SEL.ABBRV = "F"
+       S.SEL.RTNS = "FINISH"
+
+       S.SEL.HELP = "Leave this screen without printing"
+       IF THIS.MACHINE # "OFF-B" THEN
+          IF CA.NUMBER.OF.LINES # CA.LAST.STATEMENT.TRANS.NO AND CA.LAST.STATEMENT.PRINTED NE "" THEN
+             S.SEL.WORDS <1,-1> ="Mini statement"
+             S.SEL.ABBRV<1,-1> = "M"
+             S.SEL.RTNS <1,-1> = "MINI"
+             S.SEL.HELP<1,-1> = "Print transactions since last statement  on ":OCONV(CA.LAST.STATEMENT.PRINTED,"D4/")
+          END
+       END
+       S.SEL.WORDS<1,-1>="All transactions"
+       S.SEL.ABBRV<1,-1>="A"
+       S.SEL.RTNS<1,-1>= "ALL"
+       S.SEL.HELP<1,-1> = "Print all transactions"
+
+       RETURN
+
+**************************************************************************
+*****************************
+DO.LINE.SELECTION.AND.ACTION:
+*****************************
+
+       INPUT.OK = FALSE
+       LOOP UNTIL INPUT.OK DO
+          GOSUB SET.UP.SELECTION.LINE
+
+          CTL = ''
+          CRT CURSOR.ON:
+
+          CALL LINE.SELECTION(0,22,CHOICE,SEL.POS,SEL.WORDS,SEL.ABBRV,SEL.RTNS,SEL.HELP,SEL.DELIM,CTL,"","",SEL.PROMPT,ACTIVATE,SECONDARY.FORMAT,"")
+
+          CRT CURSOR.OFF:
+
+          BEGIN CASE
+             CASE CHOICE = "FILE"
+                AUDIT.HEADER = TRUE
+                GOSUB UPDATE.HEADER
+                INPUT.OK = TRUE
+
+             CASE CHOICE = "QUIT"
+                GET.OUT = TRUE
+                INPUT.OK = TRUE
+
+             CASE CHOICE = "HEADER"
+                HEADER.TYPE = ''
+                GOSUB ADVANCE.HEADER
+                IF GET.OUT THEN
+                   INPUT.OK = 1
+                END ELSE
+                   IF ADVANCE.NO = "*" THEN
+
+                      ADVANCE.TYPE = "1"
+                      GOSUB GET.PAYMENT
+                      HEADER.TYPE = "D"
+                      IF GET.OUT THEN INPUT.OK = 1
+                      GOSUB ADVANCE.HEADER.DISP
+
+                   END ELSE GOSUB DISPLAY.TRANSACTIONS
+                END
+
+             CASE CHOICE = "NEXT"
+                IF DISP.PAGE LT NO.OF.PAGES THEN
+                   DISP.PAGE = DISP.PAGE + 1
+                   GOSUB DISPLAY.TRANSACTIONS
+                END
+
+             CASE CHOICE = "PREVIOUS"
+                IF DISP.PAGE GT 1 THEN
+                   DISP.PAGE = DISP.PAGE - 1
+                   GOSUB DISPLAY.TRANSACTIONS
+                END
+
+             CASE CHOICE<1,1> = "GOTO"
+                DISP.PAGE = CHOICE<1,2>
+                GOSUB DISPLAY.TRANSACTIONS
+
+             CASE CHOICE<1,1> = "LINE"
+                TRANS.NO = CHOICE<1,2>
+                DISP.ONLY = FALSE
+                GOSUB DISPLAY.DETAILS
+                GOSUB DISPLAY.TRANSACTIONS
+
+             CASE CHOICE<1,1> = "STOP"
+                TRANS.NO = CHOICE<1,2>
+                GOSUB STOP.RECEIPT
+                HEADER.TYPE = "D"
+                GOSUB ADVANCE.HEADER.DISP
+                GOSUB DISPLAY.TRANSACTIONS
+
+             CASE CHOICE = "PAYMENT"
+                PROCEED = TRUE
+                IF BRN.TP.CARD.PROCESS = 'T' THEN
+                   GOSUB CHECK.PED.ATTACHED
+                END
+                IF PROCEED THEN
+                   CSH.CASH.ADVANCE.REFUND = FALSE
+                   ADVANCE.TYPE = "2"
+                   GOSUB GET.PAYMENT
+                   HEADER.TYPE = "D"
+                   GOSUB ADVANCE.HEADER.DISP
+                   GOSUB DISPLAY.TRANSACTIONS
+
+* Set status to 'open' if balance
+
+                   IF CA.CURRENT.BALANCE + 0 # 0 THEN
+                      CA.DATE.CLOSED = ""
+                      CA.STATUS = 2
+                   END
+
+* Need to do selection setup again in case status changed
+
+                   GOSUB SET.UP.SELECTION.LINE
+                END
+
+             CASE CHOICE = "CLOSE"
+                CA.DATE.CLOSED = DATE()
+                CA.STATUS = 3
+
+* Reset selection as status has changed
+                GOSUB SET.UP.SELECTION.LINE
+
+             CASE CHOICE = "REFUND"
+                PROCEED = TRUE
+                IF BRN.TP.CARD.PROCESS = 'T' THEN
+                   GOSUB CHECK.PED.ATTACHED
+                END
+                IF PROCEED THEN
+                   CSH.CASH.ADVANCE.REFUND = TRUE
+* Save original balance
+
+                   S.CA.CURRENT.BALANCE = CA.CURRENT.BALANCE
+
+                   ADVANCE.TYPE = "3"
+                   GOSUB GET.PAYMENT
+                   HEADER.TYPE = "D"
+
+* If full amount refunded, close advance
+
+                   IF S.CA.CURRENT.BALANCE + 0 # 0 THEN
+                      IF CA.CURRENT.BALANCE + 0 = 0 THEN
+                         CA.DATE.CLOSED = DATE()
+                         CA.STATUS = 3
+                         GOSUB SET.UP.SELECTION.LINE
+                         MATWRITEU CASH.ADVANCE.REC ON BS.CASH.ADVANCE.FV,TRM.BRN.CODE:ADVANCE.NO
+                      END
+                   END
+*
+                   GOSUB ADVANCE.HEADER.DISP
+                   GOSUB DISPLAY.TRANSACTIONS
+                END
+
+             CASE CHOICE = "STATEMENT"
+                GOSUB ADVANCE.STATEMENT
+                GOSUB DISPLAY.TRANSACTIONS
+
+             CASE CHOICE[1,5] = "CLEAR"
+                TRANS.NO = OCONV(CHOICE[6,99],"MCN")
+                GOSUB CLEAR.CHEQUE
+                HEADER.TYPE = "D"
+                GOSUB ADVANCE.HEADER.DISP
+                GOSUB DISPLAY.TRANSACTIONS
+
+             CASE CHOICE = ""
+
+             CASE 1
+                CALL ERR("ERROR WITH LINE.SELECTION ...... <RTN>",'')
+
+          END CASE
+
+       REPEAT
+       RETURN
+
+*********************************************************************
+*******************
+CHECK.PED.ATTACHED:
+*******************
+       CALL CHECK.TLG.PED(PED.STATUS)
+       IF PED.STATUS # 2 AND NOT(PAYPAGE.IS.ENABLED) THEN
+          CALL DSPLY.BOX(18,11,44,10,"Y",SY.PARAMS.FV,TERMWORK.FV)
+          MSG1 = TCREV:"  NO PED ATTACHED TO THIS TERMINAL, YOU ":NORMAL
+          MSG2 = TCREV:"  WILL ONLY BE ABLE TO PROCESS CASH     ":NORMAL
+          MSG3 = TCREV:"  TRANSACTIONS. FOR CARD TRANSACTIONS   ":NORMAL
+          MSG4 = TCREV:"  USE A TERMINAL WITH A PED ATTACHED    ":NORMAL
+          XPOS1 = INT((80 - LEN(MSG1)) / 2) + 1
+          XPOS2 = INT((80 - LEN(MSG2)) / 2) + 1
+          XPOS3 = INT((80 - LEN(MSG3)) / 2) + 1
+          XPOS4 = INT((80 - LEN(MSG4)) / 2) + 1
+          CRT.VAR = @(XPOS1,12):MSG1:@(XPOS2,13):MSG2:@(XPOS3,14):MSG3:@(XPOS4,15):MSG4 ; CRT CRT.VAR:
+          MSG = " DO YOU WISH TO PROCEED (Y/N)?  :"
+          XPOS5 = INT((80 - LEN(MSG)) / 2)
+          YPOS = 17
+          CRT @(XPOS5,YPOS):MSG:
+          HELP = " "
+          XPOS = XPOS5 + LEN(MSG) + 1
+          INP.LEN = 1
+          INP.VAL.1 = ""
+          INP.VAL.2 = "Y":VM:"N"
+          OUT.MASK = "L#1"
+          MAND = TRUE
+          GOSUB GET.USER.REPLY
+          CRT.VAR = @(0,22):CLEOL ; CRT CRT.VAR:
+          IF DATA.INP = "N" THEN
+             PROCEED = FALSE
+             CALL TPREPAINT('CURR':AM:'8-20':AM:'0-79':AM:'Y','','','')
+             GOSUB DISPLAY.TRANSACTIONS
+          END
+       END
+
+       RETURN
+*********************************************************************
+***************
+GET.USER.REPLY:
+***************
+       INPUT.COMPLETE = FALSE
+
+       LOOP UNTIL INPUT.COMPLETE DO
+          CTL = ''
+          CRT CURSOR.ON:
+          DATA.INP = ''
+          CALL INP(XPOS,YPOS,DATA.INP,INP.LEN,OUT.MASK,INP.VAL.1,INP.VAL.2,MAND,0,0,CTL,HELP,0)
+          CRT CURSOR.OFF:
+
+          BEGIN CASE
+
+             CASE CTL = ''
+                INPUT.COMPLETE = TRUE
+
+             CASE TRUE
+                ERRMSG = "'":CTL:"' IS NOT ALLOWED HERE"
+                CALL ERR(ERRMSG,"")
+
+          END CASE
+
+       REPEAT
+
+       RETURN
+
+**************************************************************************
+***************
+ADVANCE.HEADER:
+***************
+
+       SUCCESS = 1
+       LOOP
+          CALL BS.ADVANCE.HEADER(ADVANCE.NO,MAT CASH.ADVANCE.REC,HEADER.TYPE,SUCCESS,CLEAR.BEFORE.DATE)
+       UNTIL SUCCESS GE 0 DO
+          ADVANCE.NO = ''
+          CRT.VAR = CLS:SCREEN.1:@(1,0):EXT.TODAY:TOP.RIGHT ; CRT CRT.VAR
+       REPEAT
+
+       IF ADVANCE.NO = "*" THEN
+          NEW.ADVANCE = TRUE
+       END
+       IF SUCCESS = 0 THEN
+          GET.OUT = 1
+       END
+
+       IF SET.ORIG = TRUE THEN
+          MAT CASH.ADVANCE.AUDIT.REC = MAT CASH.ADVANCE.REC
+          SET.ORIG = FALSE
+       END
+
+       RETURN
+**************************************************************************
+********************
+ADVANCE.HEADER.DISP:
+********************
+
+       CALL BS.ADVANCE.HEADER(ADVANCE.NO,MAT CASH.ADVANCE.REC,HEADER.TYPE,SUCCESS,CLEAR.BEFORE.DATE)
+
+       RETURN
+
+**************************************************************************
+*********************
+DISPLAY.TRANSACTIONS:
+*********************
+
+       UNIV.START = ((DISP.PAGE-1)*10)
+       PRT = UNIV.START
+       LINE.NO = 10
+       FOR CLR = 11 TO 20
+          CRT.VAR = @(0,CLR):CLEOL ; CRT CRT.VAR:
+       NEXT CLR
+       GOSUB DISP.PAGE.COUNT
+
+       LOOP
+
+          PRT = PRT + 1
+          KEY = STR("0",4-LEN(PRT)):PRT:TRM.BRN.CODE:ADVANCE.NO
+          MATREAD CASH.ADVANCE.TRANSACTION.REC FROM BS.CASH.ADVANCE.TRANSACTION.FV,KEY ELSE MAT CASH.ADVANCE.TRANSACTION.REC = ''
+          LINE.NO = LINE.NO + 1
+
+       UNTIL CAT.TRANSACTION.TYPE = '' OR LINE.NO GT 20 DO
+
+          GOSUB CHECK.TRANS.CLEARED
+*
+* Show stopped transactions as dim
+*
+          IF CAT.ADVANCE.STOPPED.DATE NE '' THEN
+             CRT.VAR = @(79,LINE.NO):RESET:@(0,LINE.NO):DIM ; CRT CRT.VAR:
+          END
+
+          CRT.VAR = @(1,LINE.NO):PRT"R#3" ; CRT CRT.VAR:
+          CRT.VAR = @(5,LINE.NO):OCONV(CAT.TRANSACTION.DATE,"D2/") ; CRT CRT.VAR:
+          BEGIN CASE
+             CASE CAT.TRANSACTION.TYPE = 1
+                TRANS.TYPE = 'Opening balance'
+             CASE CAT.TRANSACTION.TYPE = 2
+                TRANS.TYPE = 'Top up'
+             CASE CAT.TRANSACTION.TYPE = 3
+                TRANS.TYPE = 'Refund'
+             CASE CAT.TRANSACTION.TYPE = 4
+                TRANS.TYPE = 'Sale'
+                BEGIN CASE
+                   CASE CAT.EPOS.DOCUMENT[1,1] = "A"
+                      TRANS.TYPE = "Collected sale : "
+                   CASE CAT.EPOS.DOCUMENT[1,1] = "B"
+                      TRANS.TYPE = "Delivered sale : "
+                   CASE CAT.EPOS.DOCUMENT[1,1] = "C"
+                      TRANS.TYPE = "Direct sale : "
+                   CASE 1
+                      TRANS.TYPE = "COD sale : "
+                END CASE
+                TRANS.TYPE = TRANS.TYPE:CAT.EPOS.DOCUMENT
+             CASE 1
+                TRANS.TYPE = '** unknown **'
+          END CASE
+          PAY.TYPE = ''
+          BEGIN CASE
+             CASE CAT.PAYMENT.TYPE = "1"
+                PAY.TYPE = "Cash"
+             CASE CAT.PAYMENT.TYPE = "2"
+                PAY.TYPE = "Cheque"
+             CASE CAT.PAYMENT.TYPE = "3"
+                PAY.TYPE = "CR/DB Card"
+             CASE CAT.PAYMENT.TYPE = "8"
+                PAY.TYPE = "Bank Xfer"
+             CASE 1
+                PAY.TYPE = "** pay **"
+          END CASE
+
+          IF CAT.TRANSACTION.TYPE NE "4" THEN
+             PRINT.LINE = TRANS.TYPE:" by ":PAY.TYPE
+             CRT.VAR = @(14,LINE.NO):PRINT.LINE"L#25" ; CRT CRT.VAR:
+          END ELSE
+             CRT.VAR = @(14,LINE.NO):TRANS.TYPE ; CRT CRT.VAR:
+          END
+
+          CRT.VAR = @(40,LINE.NO):CAT.USER.CREATED ; CRT CRT.VAR:
+
+          IF PRT GT 1 THEN
+             PREV.BAL = BALANCE.LIST<PRT-1>
+          END ELSE
+             PREV.BAL = 0
+          END
+
+          IF PREV.BAL = '' THEN GOSUB UPDATE.BALANCE.LIST
+
+          CLR.FLAG = ''
+          IF NOT(CLEARED.FLAG) THEN CLR.FLAG = "*"
+
+          BEGIN CASE
+             CASE CAT.TRANSACTION.TYPE LE 2
+                IF CAT.ADVANCE.STOPPED.DATE NE '' THEN
+                   CRT.VAR = @(58,LINE.NO):(CAT.NET.STOPPED.VALUE/100)"R2#10" ; CRT CRT.VAR:
+                END ELSE
+                   CRT.VAR = @(58,LINE.NO):(CAT.NET.ADVANCE.VALUE/100)"R2#10":CLR.FLAG ; CRT CRT.VAR:
+                END
+                CURR.BAL = PREV.BAL + CAT.NET.ADVANCE.VALUE
+             CASE 1
+                IF CAT.ADVANCE.STOPPED.DATE NE '' THEN
+                   CRT.VAR = @(47,LINE.NO):(CAT.NET.STOPPED.VALUE/100)"R2#9" ; CRT CRT.VAR:
+                END ELSE
+                   CRT.VAR = @(47,LINE.NO):((CAT.NET.ADVANCE.VALUE/100) + CAT.VAT.ADVANCE.VALUE / 100)"R2#9":CLR.FLAG ; CRT CRT.VAR:
+                END
+
+                CURR.BAL = PREV.BAL - CAT.NET.ADVANCE.VALUE - CAT.VAT.ADVANCE.VALUE
+          END CASE
+
+          BALANCE.LIST<PRT> = CURR.BAL
+
+          NEG.FLAG = 0
+          IF CURR.BAL LT 0 THEN
+             NEG.FLAG = 1
+             CURR.BAL = ABS(CURR.BAL)
+          END
+
+          CRT.VAR = @(69,LINE.NO):(CURR.BAL/100)"R2#10" ; CRT CRT.VAR:
+          IF NEG.FLAG THEN
+             CRT.VAR = @(79-(LEN(CURR.BAL)+2),LINE.NO):"<":@(79,LINE.NO):">" ; CRT CRT.VAR:
+          END
+
+       REPEAT
+
+       RETURN
+**************************************************************************
+****************
+DISPLAY.DETAILS:
+****************
+
+       CALL BS.ADVANCE.DISPLAY(ADVANCE.NO,CA.NUMBER.OF.LINES,TRANS.NO,DISP.ONLY,SUCCESS)
+
+       RETURN
+
+**************************************************************************
+************
+GET.PAYMENT:
+************
+
+       CALL BS.ADVANCE.PAYMENT(ADVANCE.NO,ADVANCE.TYPE,MAT CASH.ADVANCE.REC,CLEAR.BEFORE.DATE)
+       CRT.VAR = CLS:SCREEN.1:@(1,0):EXT.TODAY:TOP.RIGHT ; CRT CRT.VAR
+
+       IF CA.NUMBER.OF.LINES GT 0 THEN
+          GOSUB SET.UP.SELECTION.LINE
+       END
+
+       RETURN
+
+**************************************************************************
+**************
+UPDATE.HEADER:
+**************
+
+       IF ADVANCE.NO = "*" THEN
+          ADVANCE.TYPE = "1"
+          CALL BS.ADVANCE.PAYMENT(ADVANCE.NO,ADVANCE.TYPE,MAT CASH.ADVANCE.REC,CLEAR.BEFORE.DATE)
+          NEW.ADVANCE = TRUE
+       END
+
+       IF FINMOD.ON THEN
+          IF CA.PAYMENT.SET.ID = "" THEN
+             IN.DATA= ""
+             IN.DATA<1> = TRM.BRN.CODE:ADVANCE.NO
+             IN.DATA<2> = 1
+             IN.DATA<3> = CA.DATE.OPENED
+
+             CALL BS.CREATE.ORACLE.PAYMENT.SET.ID(IN.DATA, OUT.DATA, ERRORS)
+
+             CA.PAYMENT.SET.ID = OUT.DATA<1>
+          END
+       END
+
+       MATWRITEU CASH.ADVANCE.REC ON BS.CASH.ADVANCE.FV,TRM.BRN.CODE:ADVANCE.NO
+
+       GOSUB UPDATE.BS.TCC.XREF
+
+       IF AUDIT.HEADER THEN
+
+          IF CASH.ADVANCE.AUDIT.REC(1) NE CASH.ADVANCE.REC(1) OR CASH.ADVANCE.AUDIT.REC(2) NE CASH.ADVANCE.REC(2) OR CASH.ADVANCE.AUDIT.REC(3) NE CASH.ADVANCE.REC(3) THEN
+             UPDATE.DATE = DATE()
+             UPDATE.DATE = STR("0",6-LEN(UPDATE.DATE)):UPDATE.DATE
+             UPDATE.TIME = TIME()         ; * Ensure time is the same
+             AUDIT.KEY = TRM.BRN.CODE:DELCHAR:ADVANCE.NO:DELCHAR:"B":DELCHAR:TRM.CURR.USER:DELCHAR:UPDATE.DATE:DELCHAR:UPDATE.TIME
+             MATWRITE CASH.ADVANCE.AUDIT.REC ON BS.CASH.ADVANCE.AUDIT.FV,AUDIT.KEY
+             AUDIT.KEY = TRM.BRN.CODE:DELCHAR:ADVANCE.NO:DELCHAR:"P":DELCHAR:TRM.CURR.USER:DELCHAR:UPDATE.DATE:DELCHAR:UPDATE.TIME
+             MATWRITE CASH.ADVANCE.REC ON BS.CASH.ADVANCE.AUDIT.FV,AUDIT.KEY
+          END
+       END
+
+       RETURN
+
+*******************
+UPDATE.BS.TCC.XREF:
+*******************
+       ADV.KEY = TRM.BRN.CODE:ADVANCE.NO
+       IF CA.CASH.CUST.NO # '' AND (CAA.CASH.CUST.NO = '' OR NEW.ADVANCE = TRUE) THEN
+          BS.TCC.KEY = CA.CASH.CUST.NO
+          GOSUB READ.BS.TCC.XREF
+          GOSUB LINK.BS.TCC
+          GOSUB WRITE.BS.TCC.XREF
+       END
+       IF CA.CASH.CUST.NO = '' AND CAA.CASH.CUST.NO # '' THEN
+          BS.TCC.KEY = CAA.CASH.CUST.NO
+          GOSUB READ.BS.TCC.XREF
+          GOSUB UNLINK.BS.TCC
+          GOSUB WRITE.BS.TCC.XREF
+       END
+       IF CA.CASH.CUST.NO # '' AND CAA.CASH.CUST.NO # '' THEN
+          IF CA.CASH.CUST.NO # CAA.CASH.CUST.NO THEN
+             BS.TCC.KEY = CA.CASH.CUST.NO
+             GOSUB READ.BS.TCC.XREF
+             GOSUB LINK.BS.TCC
+             GOSUB WRITE.BS.TCC.XREF
+             BS.TCC.KEY = CAA.CASH.CUST.NO
+             GOSUB READ.BS.TCC.XREF
+             GOSUB UNLINK.BS.TCC
+             GOSUB WRITE.BS.TCC.XREF
+          END
+       END
+
+       RETURN
+
+******************
+WRITE.BS.TCC.XREF:
+******************
+
+       IF BS.TCC.TO.ADVANCE.XREF.REC(1) # '' THEN
+          MATWRITE BS.TCC.TO.ADVANCE.XREF.REC ON BS.TCC.TO.ADVANCE.XREF.FV,BS.TCC.KEY
+       END ELSE
+          DELETE BS.TCC.TO.ADVANCE.XREF.FV,BS.TCC.KEY
+       END
+
+       RETURN
+
+************
+LINK.BS.TCC:
+************
+
+       LOCATE ADV.KEY IN BS.TCC.TO.ADVANCES<1> BY 'AR' SETTING POS ELSE
+          BS.TCC.TO.ADVANCES = INSERT(BS.TCC.TO.ADVANCES,1,POS;ADV.KEY)
+       END
+
+       RETURN
+
+**************
+UNLINK.BS.TCC:
+**************
+
+       LOCATE ADV.KEY IN BS.TCC.TO.ADVANCES<1> BY 'AR' SETTING POS THEN
+          BS.TCC.TO.ADVANCES = DELETE(BS.TCC.TO.ADVANCES,1,POS)
+       END
+       RETURN
+
+*****************
+READ.BS.TCC.XREF:
+*****************
+
+       LOOP
+          RETRY = 0
+          MATREADU BS.TCC.TO.ADVANCE.XREF.REC FROM BS.TCC.TO.ADVANCE.XREF.FV,BS.TCC.KEY LOCKED RETRY = 1 ELSE
+             BS.TCC.TO.ADVANCE.XREF.REC(1) = ''
+          END
+          IF RETRY THEN
+             MSG = "TCC ADVANCES CROSS REFERENCE RECORD LOCKED BY PORT ":STATUS()
+             CALL ERR(MSG,"")
+          END
+       WHILE RETRY DO
+       REPEAT
+
+       RETURN
+
+**************************************************************************
+****************
+DISP.PAGE.COUNT:
+****************
+
+       NO.OF.PAGES = INT(CA.NUMBER.OF.LINES/10) + (MOD(CA.NUMBER.OF.LINES,10) # 0)
+
+       CRT.VAR = @(66,6):DISP.PAGE"R#3":@(75,6):NO.OF.PAGES"R#3" ; CRT CRT.VAR:
+
+       RETURN
+**************************************************************************
+********************
+UPDATE.BALANCE.LIST:
+********************
+
+       FOR UPD = 1 TO PRT
+          IF UPD GT 1 THEN
+             PREV.BAL = BALANCE.LIST<UPD-1>
+          END ELSE
+             PREV.BAL = 0
+          END
+          IF BALANCE.LIST<UPD> = '' THEN
+             MATREAD CASH.ADVANCE.TRANSACTION.REC FROM BS.CASH.ADVANCE.TRANSACTION.FV,STR("0",4-LEN(UPD)):UPD:TRM.BRN.CODE:ADVANCE.NO ELSE
+                CAT.NET.ADVANCE.VALUE = 0
+                CAT.TRANSACTION.TYPE = 0
+             END
+             BEGIN CASE
+                CASE CAT.TRANSACTION.TYPE LE 2
+                   CURR.BAL = PREV.BAL + CAT.NET.ADVANCE.VALUE
+                CASE 1
+                   CURR.BAL = PREV.BAL - CAT.NET.ADVANCE.VALUE - (CAT.VAT.ADVANCE.VALUE + 0)
+             END CASE
+             BALANCE.LIST<UPD> = CURR.BAL
+          END
+       NEXT UPD
+       RETURN
+**************************************************************************
+******************
+ADVANCE.STATEMENT:
+******************
+
+       S.INPUT.OK = FALSE
+       GET.OUT = FALSE
+
+       LOOP UNTIL S.INPUT.OK DO
+
+          CTL = ''
+          CRT CURSOR.ON:
+
+          CALL LINE.SELECTION(0,22,CHOICE,S.SEL.POS,S.SEL.WORDS,S.SEL.ABBRV,S.SEL.RTNS,S.SEL.HELP,SEL.DELIM,CTL,"","",S.SEL.PROMPT,ACTIVATE,S.SECONDARY.FORMAT,"")
+
+          CRT CURSOR.OFF:
+
+          BEGIN CASE
+             CASE CHOICE = "FINISH"
+                S.INPUT.OK = TRUE
+                GET.OUT = TRUE
+             CASE CHOICE = "MINI"
+                FROM.TRANS = CA.LAST.STATEMENT.TRANS.NO
+                S.INPUT.OK = TRUE
+             CASE CHOICE = "ALL"
+                FROM.TRANS = 0
+                S.INPUT.OK = TRUE
+          END CASE
+       REPEAT
+
+       IF NOT(GET.OUT) THEN
+          CRT @(0,22):
+          CALL BS.ADVANCE.PRINT(ADVANCE.NO,FROM.TRANS,"S",MAT CASH.ADVANCE.REC,MAT CASH.ADVANCE.TRANSACTION.REC,COMPLETE,CLEAR.BEFORE.DATE,'','','','','')
+          CA.LAST.STATEMENT.TRANS.NO = CA.NUMBER.OF.LINES
+          CA.LAST.STATEMENT.PRINTED = DATE()
+          AUDIT.HEADER = FALSE
+          GOSUB UPDATE.HEADER
+
+       END
+
+       GET.OUT = FALSE
+
+       RETURN
+
+**************************************************************************
+*************
+CLEAR.CHEQUE:
+*************
+
+       DISP.ONLY = 1
+       CALL BS.ADVANCE.DISPLAY(ADVANCE.NO,CA.NUMBER.OF.LINES,TRANS.NO,DISP.ONLY,SUCCESS)
+
+       IF SUCCESS THEN
+          KEY = STR("0",4-LEN(TRANS.NO)):TRANS.NO:TRM.BRN.CODE:ADVANCE.NO
+          LOOP
+             RETRY = 0
+             MATREADU CASH.ADVANCE.TRANSACTION.REC FROM BS.CASH.ADVANCE.TRANSACTION.FV,KEY LOCKED RETRY = 1 ELSE
+                FATAL.ERROR.MSG = "CAN NOT READ TRANSACTION RECORD '":KEY:"'"
+                GOSUB FATAL.ERROR
+             END
+          UNTIL RETRY = 0 DO
+             CALL ERR("TRANSACTION RECORD LOCKED","")
+          REPEAT
+
+          GOSUB CHECK.TRANS.CLEARED
+
+          ERR.FOUND = 0
+          IF CAT.PAYMENT.TYPE NE "2" THEN
+             CALL ERR("TRANSACTION IS NOT PAID BY CHEQUE","")
+             ERR.FOUND = 1
+          END ELSE
+             IF CAT.TRANSACTION.TYPE GT 2 THEN
+                CALL ERR("TRANSACTION IS NOT A RECEIPT","")
+                ERR.FOUND = TRUE
+             END ELSE
+                IF CLEARED.FLAG THEN
+                   IF CLEARED.FLAG = 1 THEN         ; * delse-30/08/96
+                      CALL ERR("TRANSACTION ALREADY CLEARED","")
+                   END ELSE               ; * delse-30/08/96
+                      CALL ERR("TRANSACTION HAS BEEN 'STOPPED' AND CANNOT BE CLEARED!","")  ; * delse-30/08/96
+                   END                    ; * delse-30/08/96
+                   ERR.FOUND = 1
+                END
+             END
+          END
+
+          IF NOT(ERR.FOUND) THEN
+             SUCCESS.FLAG = TRUE
+             SEARCH.TRANS.NO = TRANS.NO
+             SEARCH.TRANS.NO += 0
+             LOCATE SEARCH.TRANS.NO IN CA.CHQ.PAYMENT.XREF<1> SETTING XREF.POS THEN
+                CHQ.PAYMENT.KEY = CA.CHQ.PAYMENT.KEYS<1,XREF.POS>
+                CALLING.MODE = "ADVANCE"
+                REDRAW.SCREEN = FALSE
+                SC.ORIG = SC.CURR
+                CALL BS.OE.CHECK.SPECIAL.CLEARANCE(REDRAW.SCREEN,CALLING.MODE,CHQ.PAYMENT.KEY,SUCCESS.FLAG,"","","","","","","")
+                SC.CURR = SC.ORIG
+                IF REDRAW.SCREEN THEN
+                   REDISPLAY = ""
+                   REDISPLAY<1> = "CURR"
+                   REDISPLAY<2> = "6-17"
+                   REDISPLAY<3> = "01-79"
+                   REDISPLAY<4> = ""
+                   CALL TPREPAINT(REDISPLAY,"","","")
+                END
+             END
+             IF SUCCESS.FLAG THEN
+*
+* GET AUTHORISATION TO CLEAR THE CHEQUE
+*
+                CRT.VAR = @(17,20):RESET:@(0,20):DIM:"Manager        :" ; CRT CRT.VAR:
+                CRT.VAR = @(56,20):RESET:@(41,20):DIM:"Password     :" ; CRT CRT.VAR:
+
+                GET.OUT = 0
+                GOSUB GET.AUTH.CODE
+
+                IF NOT(GET.OUT) THEN
+                   GOSUB GET.PASSWORD
+                   IF NOT(GET.OUT) THEN
+
+                      CAT.DATE.CLEARED.CHEQUE = DATE()
+                      CAT.TIME.CLEARED.CHEQUE = TIME()        ; * delse-27/08/96
+                      CAT.USER.CLEARED.CHEQUE = AUTH.CODE     ; * delse-27/08/96
+                      MATWRITE CASH.ADVANCE.TRANSACTION.REC ON BS.CASH.ADVANCE.TRANSACTION.FV,KEY
+                   END
+                END
+             END
+          END
+          RELEASE BS.CASH.ADVANCE.TRANSACTION.FV,KEY
+       END
+
+       RETURN
+**************************************************************************
+********************
+CHECK.TRANS.CLEARED:
+********************
+
+       CLEARED.FLAG = 1
+       IF CAT.TRANSACTION.TYPE = 1 OR CAT.TRANSACTION.TYPE = 2 THEN
+          IF CAT.PAYMENT.TYPE = 2 THEN
+             IF CAT.DATE.CLEARED.CHEQUE = '' THEN
+                SPECIAL.CLEAR = FALSE
+                GOSUB CHECK.FOR.SPECIALS
+                IF SPECIAL.CLEAR THEN
+                   CLEARED.FLAG = 0
+                END
+                IF CAT.TRANSACTION.DATE GT CLEAR.BEFORE.DATE THEN
+                   CLEARED.FLAG = 0
+                END
+             END
+          END
+       END
+
+* If cheque 'Stopped' then prevent clearance
+
+       IF CAT.STOPPED.BY # '' THEN CLEARED.FLAG = 2
+
+       RETURN
+
+**************************************************************************
+*******************
+CHECK.FOR.SPECIALS:
+*******************
+
+       SEARCH.TRANS.NO = KEY[1,4]
+       SEARCH.TRANS.NO += 0
+       LOCATE SEARCH.TRANS.NO IN CA.CHQ.PAYMENT.XREF<1> SETTING XREF.POS THEN
+          CHQ.PAYMENT.KEY = CA.CHQ.PAYMENT.KEYS<1,XREF.POS>
+          MATREAD CHQ.PAYMENT.REC FROM CHQ.PAYMENT.FV, CHQ.PAYMENT.KEY THEN
+             IF CHP.SPECIAL.CLEARANCE = "Y" THEN
+                SPECIAL.CLEAR = TRUE
+             END
+          END
+       END
+
+       RETURN
+
+**************************************************************************
+*************
+STOP.RECEIPT:
+*************
+
+       DISP.ONLY = 1
+       CALL BS.ADVANCE.DISPLAY(ADVANCE.NO,CA.NUMBER.OF.LINES,TRANS.NO,DISP.ONLY,SUCCESS)
+
+       IF SUCCESS THEN
+          KEY = STR("0",4-LEN(TRANS.NO)):TRANS.NO:TRM.BRN.CODE:ADVANCE.NO
+          LOOP
+             RETRY = 0
+             MATREADU CASH.ADVANCE.TRANSACTION.REC FROM BS.CASH.ADVANCE.TRANSACTION.FV,KEY LOCKED RETRY = 1 ELSE
+                FATAL.ERROR.MSG = "CAN NOT READ TRANSACTION RECORD '":KEY:"'"
+                GOSUB FATAL.ERROR
+             END
+          UNTIL RETRY = 0 DO
+             CALL ERR("TRANSACTION RECORD LOCKED","")
+          REPEAT
+
+          IF CAT.PAYMENT.TYPE = 2 THEN
+             CALL ERR("WARNING - THIS WILL NOT STOP CASH BANKING. ONLY USE IF CHEQUE HAS BOUNCED","")
+          END
+
+          GOSUB CHECK.TRANS.CLEARED
+
+          BEGIN CASE
+             CASE CAT.TRANSACTION.TYPE GT 2
+                CALL ERR("TRANSACTION IS NOT A RECEIPT","")
+             CASE CAT.PAYMENT.TYPE = 1
+                CALL ERR("TRANSACTION IS PAID BY CASH","")
+             CASE CAT.PAYMENT.TYPE = 3
+                CALL ERR("TRANSACTION IS PAID BY CARD","")
+             CASE CAT.ADVANCE.STOPPED.DATE NE ''
+                CALL ERR("TRANSACTION ALREADY STOPPED","")
+             CASE 1
+*
+* GET AUTHORISATION TO CLEAR THE CHEQUE
+*
+                SUCCESS.FLAG = TRUE
+                SEARCH.TRANS.NO = TRANS.NO
+                SEARCH.TRANS.NO += 0
+                LOCATE SEARCH.TRANS.NO IN CA.CHQ.PAYMENT.XREF<1> SETTING XREF.POS THEN
+                   CHQ.PAYMENT.KEY = CA.CHQ.PAYMENT.KEYS<1,XREF.POS>
+                   CALLING.MODE = "ADVANCE"
+                   REDRAW.SCREEN = FALSE
+                   SC.ORIG = SC.CURR
+                   CALL BS.OE.CHECK.SPECIAL.CLEARANCE(REDRAW.SCREEN,CALLING.MODE,CHQ.PAYMENT.KEY,SUCCESS.FLAG,"","","","","","","")
+                   SC.CURR = SC.ORIG
+                   IF REDRAW.SCREEN THEN
+                      REDISPLAY = ""
+                      REDISPLAY<1> = "CURR"
+                      REDISPLAY<2> = "6-17"
+                      REDISPLAY<3> = "01-79"
+                      REDISPLAY<4> = ""
+                      CALL TPREPAINT(REDISPLAY,"","","")
+
+                   END
+                END
+                IF SUCCESS.FLAG THEN
+
+                   CRT.VAR = @(17,19):RESET:@(0,19):DIM:"Notes          :" ; CRT CRT.VAR:
+                   CRT.VAR = @(17,20):RESET:@(0,20):DIM:"Manager        :" ; CRT CRT.VAR:
+                   CRT.VAR = @(56,20):RESET:@(41,20):DIM:"Password     :" ; CRT CRT.VAR:
+
+                   GET.OUT = 0
+
+                   GOSUB GET.NOTES
+
+                   IF NOT(GET.OUT) THEN
+
+                      GOSUB GET.AUTH.CODE
+
+                      IF NOT(GET.OUT) THEN
+
+                         GOSUB GET.PASSWORD
+
+                         IF NOT(GET.OUT) THEN
+                            CAT.NET.STOPPED.VALUE = CAT.NET.ADVANCE.VALUE
+                            CAT.NET.ADVANCE.VALUE = 0
+                            CAT.ADVANCE.STOPPED.DATE = DATE()
+                            CAT.STOPPED.BY = AUTH.CODE
+                            MATWRITE CASH.ADVANCE.TRANSACTION.REC ON BS.CASH.ADVANCE.TRANSACTION.FV,KEY
+
+                            CA.CURRENT.BALANCE = CA.CURRENT.BALANCE - CAT.NET.STOPPED.VALUE
+!
+! if balance goes negative then display box
+! print statement and close the account automatically
+                            IF CA.CURRENT.BALANCE LT 0 THEN
+                               FOR ZZI = 12 TO 20
+                                  CRT.VAR = @(0,ZZI):CLEOL ; CRT CRT.VAR:
+                               NEXT ZZI
+                               CALL DSPLY.BOX(17,14,45,7,"Y",SY.PARAMS.FV,TERMWORK.FV)
+                               CRT.VAR = @(18,15):TCDIM:" The account is in debit by :":NORMAL:" ":OCONV(0 - CA.CURRENT.BALANCE,"MR2") ; CRT CRT.VAR:
+                               CRT.VAR = @(18,16):TCDIM:" The account will be closed automatically":NORMAL ; CRT CRT.VAR:
+                               CRT.VAR = @(18,17):TCREVFLASHDIM:" REFER TO MANAGER ":NORMAL ; CRT CRT.VAR:
+                               CRT.VAR = @(18,18):TCDIM:" Printing statement of account :":NORMAL ; CRT CRT.VAR:
+                               XXD=""
+                               CTL=""
+                               HELP="Press Return to continue"
+                               CALL INP(55,18,XXD,1,'L#1','','',0,0,0,CTL,HELP,0)
+                               CA.CURRENT.BALANCE = 0
+                               CA.DATE.CLOSED = DATE()
+                               CA.STATUS = 3
+                               CRT @(20,19):
+
+                               CRT @(0,22):
+
+                               CALL BS.ADVANCE.PRINT(ADVANCE.NO,'0',"S",MAT CASH.ADVANCE.REC,MAT CASH.ADVANCE.TRANSACTION.REC,COMPLETE,CLEAR.BEFORE.DATE)
+
+                               GOSUB SET.UP.SELECTION.LINE
+                            END
+                            MATWRITEU CASH.ADVANCE.REC ON BS.CASH.ADVANCE.FV,TRM.BRN.CODE:ADVANCE.NO
+
+                         END
+                      END
+                   END
+                END
+          END CASE
+          RELEASE BS.CASH.ADVANCE.TRANSACTION.FV,KEY
+       END
+
+       RETURN
+**************************************************************************
+**********
+GET.NOTES:
+**********
+
+       INPUT.COMPLETE = FALSE
+
+       HELP = "Enter reason payment transaction is being stopped"
+
+       CAT.REASON.STOPPED.NOTES = ''
+
+       LOOP UNTIL INPUT.COMPLETE DO
+          CTL = ''
+          CRT CURSOR.ON:
+          CALL INP(18,19,CAT.REASON.STOPPED.NOTES,50,'L#50','','0X1X',1,0,0,CTL,HELP,0)
+          CRT CURSOR.OFF:
+
+          BEGIN CASE
+             CASE CTL = "/"
+                INPUT.COMPLETE = TRUE
+                GET.OUT = TRUE
+
+             CASE CTL NE NULL
+                CALL ERR("ENTER REASON RECEIPT IS BEING STOPPED OR / TO EXIT","")
+
+             CASE ADVANCE.NO MATCHES '0X1X'
+                INPUT.COMPLETE = TRUE
+             CASE 1
+                CALL ERR("PLEASE ENTER A REASON FOR THE TRANSACTION BEING STOPPED OR / TO EXIT","")
+          END CASE
+
+       REPEAT
+
+       RETURN
+
+**************************************************************************
+**************
+GET.AUTH.CODE:
+**************
+
+       INPUT.COMPLETE = FALSE
+
+       HELP = "Enter authorisation code"
+
+       AUTH.CODE = ''
+
+       LOOP UNTIL INPUT.COMPLETE DO
+          CTL = ''
+          CRT CURSOR.ON:
+          CALL INP(18,20,AUTH.CODE,5,'L#5','','0X1X',1,0,0,CTL,HELP,0)
+          CRT CURSOR.OFF:
+
+          BEGIN CASE
+             CASE CTL = "/"
+                INPUT.COMPLETE = TRUE
+                GET.OUT = TRUE
+
+             CASE CTL NE NULL
+                CALL ERR("ENTER AUTHORISATION CODE OR / TO EXIT","")
+             CASE LEN(AUTH.CODE) LT 3
+                CALL ERR("MANAGERS MUST BE 3 TO 5 CHARACTERS LONG","")
+
+             CASE AUTH.CODE MATCHES '0X1X'
+                READ TST FROM USER.DEFS.FV,OCONV(AUTH.CODE,"MCU") THEN
+                   CALL ACCESS.AUTH(AUTH.CODE,"CASH.ADVANCE.AUTH",STATUS)
+                   IF STATUS = 1 THEN
+                      INPUT.COMPLETE = TRUE
+                   END ELSE
+                      CALL ERR("INVALID AUTHORISATION CODE","")
+                   END
+                END ELSE
+                   CALL ERR("USER DOES NOT EXIST","")
+                END
+
+             CASE 1
+                CALL ERR("PLEASE ENTER A VALID AUTHORISATION CODE OR / TO EXIT","")
+          END CASE
+
+       REPEAT
+
+       RETURN
+**************************************************************************
+***************
+GET.PASSWORD:
+***************
+
+       INPUT.COMPLETE = FALSE
+
+       HELP = "Enter password for user or / to exit"
+
+       MANAGER.PASSWORD = ''
+
+       LOOP UNTIL INPUT.COMPLETE DO
+          CTL = ''
+          CRT CURSOR.ON:
+          CRT @(57,20):
+          ECHO OFF
+          INPUT MANAGER.PASSWORD,24:_
+          ECHO ON
+          CRT CURSOR.OFF:
+
+          BEGIN CASE
+             CASE MANAGER.PASSWORD = "/"
+                INPUT.COMPLETE = TRUE
+                GET.OUT = TRUE
+
+             CASE CTL NE NULL
+                CALL ERR("ENTER USERS PASSWORD OR / TO EXIT","")
+
+             CASE ADVANCE.NO MATCHES '0X1X'
+*
+* VALIDATE MANAGERS AUTHORISATION CODE
+*
+                CALL CHECK.PASSWORD(AUTH.CODE,MANAGER.PASSWORD,STATUS)
+                IF STATUS = TRUE THEN
+                   INPUT.COMPLETE = TRUE
+                END ELSE
+                   CALL ERR("INVALID AUTHORISATION CODE","")
+                END
+             CASE 1
+                CALL ERR("PLEASE ENTER A VALID PASSWORD OR / TO EXIT","")
+                MANAGER.PASSWORD = ''
+          END CASE
+
+       REPEAT
+
+       RETURN
+
+**************************************************************************
+*******************
+OPEN.REMOTE.FILES:
+*******************
+* open remote files
+       MATREAD BRN.DETAIL.REC FROM BRN.DETAIL.FV,TRM.BRN.CODE THEN
+          POS.MCH = BRN.MACH.NME[1,1]:BRN.MACH.NME[5,1]
+
+          GOSUB OPEN.BS.CASH.ADVANCE
+          GOSUB OPEN.BS.CASH.ADVANCE.TRANSACTION
+          GOSUB OPEN.CASH
+          GOSUB OPEN.CASH.XREF
+          GOSUB OPEN.BS.CASH.ADVANCE.AUDIT
+          GOSUB OPEN.BS.TCC.TO.ADVANCE.XREF
+          GOSUB OPEN.CHQ.PAYMENT
+
+       END
+
+       RETURN
+
+**************************************************************************
+*********************
+OPEN.BS.CASH.ADVANCE:
+*********************
+       FILE.NAME = "BS-CASH-ADVANCE"
+       ACCOUNT.NAME = POS.MCH:":STOCK"
+       GOSUB CALL.OPEN.VOC.ENTRY
+       BS.CASH.ADVANCE.FV = FILE.NAME.FV
+       RETURN
+**************************************************************************
+*********************************
+OPEN.BS.CASH.ADVANCE.TRANSACTION:
+*********************************
+       FILE.NAME = "BS-CASH-ADVANCE-TRANSACTION"
+       ACCOUNT.NAME = POS.MCH:":STOCK"
+       GOSUB CALL.OPEN.VOC.ENTRY
+       BS.CASH.ADVANCE.TRANSACTION.FV = FILE.NAME.FV
+       RETURN
+**************************************************************************
+**********
+OPEN.CASH:
+**********
+
+       FILE.NAME = "CASH"
+       ACCOUNT.NAME = POS.MCH:":":BRN.ACCT.NME
+       GOSUB CALL.OPEN.VOC.ENTRY
+       CASH.FV = FILE.NAME.FV
+       RETURN
+
+**************************************************************************
+***************
+OPEN.CASH.XREF:
+***************
+
+       FILE.NAME = "CASH-XREF"
+       ACCOUNT.NAME = POS.MCH:":BRN.ACCT.NME"
+       GOSUB CALL.OPEN.VOC.ENTRY
+       CASH.XREF.FV = FILE.NAME.FV
+       RETURN
+
+**************************************************************************
+***************************
+OPEN.BS.CASH.ADVANCE.AUDIT:
+***************************
+
+       FILE.NAME = "BS-CASH-ADVANCE-AUDIT"
+       ACCOUNT.NAME = POS.MCH:":STOCK"
+       GOSUB CALL.OPEN.VOC.ENTRY
+       BS.CASH.ADVANCE.AUDIT.FV = FILE.NAME.FV
+       RETURN
+
+**************************************************************************
+****************************
+OPEN.BS.TCC.TO.ADVANCE.XREF:
+****************************
+
+       FILE.NAME = "BS-TCC-TO-ADVANCE-XREF"
+       ACCOUNT.NAME = POS.MCH:":STOCK"
+       GOSUB CALL.OPEN.VOC.ENTRY
+       BS.TCC.TO.ADVANCE.FV = FILE.NAME
+       RETURN
+
+**************************************************************************
+*****************
+OPEN.CHQ.PAYMENT:
+*****************
+
+       FILE.NAME = "CHQ-PAYMENT"
+       ACCOUNT.NAME = POS.MCH:":VGROUP"
+       GOSUB CALL.OPEN.VOC.ENTRY
+       CHQ.PAYMENT.FV = FILE.NAME
+       RETURN
+
+**************************************************************************
+********************
+CALL.OPEN.VOC.ENTRY:
+********************
+
+       KEEP.VOC.FLAG = ""
+       OPEN.FILE.ERR = ""
+       CALL CREATE.AND.OPEN.VOC.ENTRY(OPEN.FILE.ERR, ACCOUNT.NAME, FILE.NAME, FILE.NAME.FV, KEEP.VOC.FLAG, Q.NAME, "", "", "", "", "")
+       IF OPEN.FILE.ERR # "" THEN
+          ERROR.MESSAGE = "COULD NOT REMOTELY OPEN ":FILE.NAME:" FILE ON ":POS.MCH
+          ERROR = TRUE
+       END
+
+       RETURN
+**************************************************************************
+************
+FATAL.ERROR:
+************
+       VAR = ''
+       VAR<1,1> = "V1"
+       VAR<1,2> = PROGRAM.NAME
+       VAR<1,3> = DATE()
+       VAR<1,4> = TIME()
+       VAR<1,5> = LOWER(SYSTEM(9001))
+       VAR<2> = FATAL.ERROR.MSG
+       VAR<-1> = "!"
+       DATA VAR
+       CHAIN "SY.FATAL.ERROR"
+       RETURN
+**************************************************************************
+       INCLUDE INCLUDES TRANS.BOUNDS
+**************************************************************************
+       END
